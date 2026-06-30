@@ -106,6 +106,27 @@ async function patchRecord(recordId, fields) {
   return res.json();
 }
 
+/* Tries to persist a resolved poster URL back to Airtable.
+   1) Poster/Image attachment field (Airtable will fetch & store the image itself).
+   2) Fallback: a plain text/URL field literally named "Poster URL", if it exists.
+   Returns { ok, field } or { ok: false, reason } — never throws. */
+async function savePosterUrlToAirtable(record, url) {
+  try {
+    await patchRecord(record.id, { [FIELDS.poster]: [{ url }] });
+    record.fields[FIELDS.poster] = [{ url }];
+    return { ok: true, field: 'Poster/Image' };
+  } catch (e) {
+    // Attachment write failed — try the plain-text fallback field.
+  }
+  try {
+    await patchRecord(record.id, { [POSTER_URL_FIELD]: url });
+    record.fields[POSTER_URL_FIELD] = url;
+    return { ok: true, field: POSTER_URL_FIELD };
+  } catch (e) {
+    return { ok: false, reason: 'no-field' };
+  }
+}
+
 async function createRecords(fieldsArray) {
   // Airtable allows max 10 records per create call — batch automatically.
   const url = `https://api.airtable.com/v0/${CONFIG.baseId}/${encodeURIComponent(CONFIG.table)}`;
@@ -138,11 +159,15 @@ function f(record, key) {
 
 function asArray(v) { return Array.isArray(v) ? v : (v ? [v] : []); }
 
+const POSTER_URL_FIELD = 'Poster URL'; // fallback text/URL field if the Poster/Image attachment field can't be written to
+
 function posterUrl(record) {
   const att = f(record, 'poster');
   if (att && att[0]) {
     return att[0].thumbnails ? (att[0].thumbnails.large || att[0].thumbnails.full || att[0]).url : att[0].url;
   }
+  const fallback = record.fields && record.fields[POSTER_URL_FIELD];
+  if (fallback) return fallback;
   return null;
 }
 
@@ -195,6 +220,8 @@ async function resolvePoster(record) {
 }
 
 /* Swaps a skeleton placeholder element's background once an image is resolved & preloaded, with a fade-in. */
+let posterFieldWarningShown = false;
+
 function hydratePosterEl(el, record) {
   if (!el || el.dataset.hydrated) return;
   el.dataset.hydrated = '1';
@@ -205,9 +232,18 @@ function hydratePosterEl(el, record) {
   }
   if (!CONFIG.tmdbKey) return; // no key configured — keep the cinematic fallback as final state
   el.classList.add('skeleton');
-  fetchTmdbPoster(record).then(url => {
+  fetchTmdbPoster(record).then(async url => {
     el.classList.remove('skeleton');
-    if (url) paintPoster(el, url);
+    if (!url) return;
+    paintPoster(el, url);
+    if (CONFIG.writeEnabled) {
+      const result = await savePosterUrlToAirtable(record, url);
+      saveCache(RECORDS);
+      if (!result.ok && !posterFieldWarningShown) {
+        posterFieldWarningShown = true;
+        toast('Posters found but not saved — add a "Poster URL" field in Airtable (see Settings)');
+      }
+    }
   });
 }
 
@@ -342,6 +378,7 @@ async function boot() {
   wireAddRecScreen();
   wireBulkImport();
   wireInstallFlow();
+  wireFetchMissingPosters();
 
   if (!CONFIG || !CONFIG.baseId || !CONFIG.token) {
     showScreen('setup');
@@ -505,7 +542,7 @@ function resetAddRecForm() {
 function parseBulkLine(line) {
   const parts = line.split('|').map(p => p.trim());
   if (parts.length < 1 || !parts[0]) return null;
-  const [title, type, yearStr, language, priority, mood, matchStr, why] = parts;
+  const [title, type, yearStr, language, priority, mood, matchStr, why, streaming] = parts;
   return {
     title,
     type: type || 'Movie',
@@ -515,78 +552,121 @@ function parseBulkLine(line) {
     mood: mood || '',
     match: matchStr ? parseInt(matchStr, 10) : null,
     why: why || '',
+    streaming: streaming || '',
   };
 }
 
+function buildFieldsFromParsedRow(parsed) {
+  const listTag = parsed.language === 'English' ? 'English Recommendation' : 'Foreign Dub Recommendation';
+  const fields = {
+    [FIELDS.title]: parsed.title,
+    [FIELDS.type]: parsed.type,
+    [FIELDS.status]: 'Want to Watch',
+    [FIELDS.lists]: ['Watch List', listTag],
+    [FIELDS.language]: parsed.language,
+    [FIELDS.priority]: parsed.priority,
+    [FIELDS.recSource]: 'ChatGPT',
+  };
+  if (parsed.year) fields[FIELDS.year] = parsed.year;
+  if (parsed.match !== null && !isNaN(parsed.match)) fields[FIELDS.matchPct] = parsed.match / 100;
+  if (parsed.why) fields[FIELDS.why] = parsed.why;
+  if (parsed.mood) fields[FIELDS.mood] = [parsed.mood];
+  if (parsed.streaming) fields[FIELDS.currentStreaming] = parsed.streaming.split(',').map(s => s.trim()).filter(Boolean);
+  return fields;
+}
+
+let pendingQuickAdd = null; // { toCreate: [...], toUpdate: [...], errors: [...] }
+
 function wireBulkImport() {
-  document.getElementById('bulkImportBtn').addEventListener('click', async () => {
+  document.getElementById('bulkImportBtn').addEventListener('click', () => {
     if (!CONFIG.writeEnabled) { toast('Enable write access in Settings first'); return; }
     const raw = document.getElementById('bulkTextarea').value;
-    const lines = raw.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('Title |') && !l.match(/^Title\s*\|/i));
-    const resultsEl = document.getElementById('bulkResults');
+    const lines = raw.split('\n').map(l => l.trim()).filter(l => l && !l.match(/^Title\s*\|/i));
     if (!lines.length) { toast('Paste at least one line first'); return; }
 
-    resultsEl.innerHTML = '<p class="muted small">Importing…</p>';
     const toCreate = [];
     const toUpdate = [];
-    const rowResults = [];
+    const errors = [];
 
     lines.forEach(line => {
       const parsed = parseBulkLine(line);
       if (!parsed || !parsed.title) {
-        rowResults.push({ status: 'error', title: line.slice(0, 40), msg: 'Could not parse line' });
+        errors.push({ line: line.slice(0, 60) });
         return;
       }
-      const listTag = parsed.language === 'English' ? 'English Recommendation' : 'Foreign Dub Recommendation';
-      const fields = {
-        [FIELDS.title]: parsed.title,
-        [FIELDS.type]: parsed.type,
-        [FIELDS.status]: 'Want to Watch',
-        [FIELDS.lists]: ['Watch List', listTag],
-        [FIELDS.language]: parsed.language,
-        [FIELDS.priority]: parsed.priority,
-        [FIELDS.recSource]: 'ChatGPT',
-      };
-      if (parsed.year) fields[FIELDS.year] = parsed.year;
-      if (parsed.match !== null && !isNaN(parsed.match)) fields[FIELDS.matchPct] = parsed.match / 100;
-      if (parsed.why) fields[FIELDS.why] = parsed.why;
-      if (parsed.mood) fields[FIELDS.mood] = [parsed.mood];
-
+      const fields = buildFieldsFromParsedRow(parsed);
       const existing = findRecordByTitle(parsed.title);
       if (existing) {
         toUpdate.push({ id: existing.id, fields, title: parsed.title });
       } else {
-        toCreate.push(fields);
-        rowResults.push({ status: 'created', title: parsed.title });
+        toCreate.push({ fields, title: parsed.title });
       }
     });
 
-    try {
-      for (const u of toUpdate) {
-        await patchRecord(u.id, u.fields);
-        rowResults.push({ status: 'updated', title: u.title });
-      }
-      if (toCreate.length) await createRecords(toCreate);
-
-      RECORDS = await fetchAllRecords();
-      saveCache(RECORDS);
-      renderAll();
-
-      const createdCount = rowResults.filter(r => r.status === 'created').length;
-      const updatedCount = rowResults.filter(r => r.status === 'updated').length;
-      const errorCount = rowResults.filter(r => r.status === 'error').length;
-
-      resultsEl.innerHTML = `<div class="bulk-summary">${createdCount} added · ${updatedCount} updated${errorCount ? ' · ' + errorCount + ' skipped' : ''}</div>` +
-        rowResults.map(r => `<div class="bulk-result-row ${r.status}"><span>${escapeHtml(r.title)}</span><span class="bulk-result-tag">${r.status}</span></div>`).join('');
-
-      document.getElementById('bulkTextarea').value = '';
-      toast('Import complete');
-    } catch (e) {
-      console.error(e);
-      resultsEl.innerHTML = `<p class="muted small">Import failed partway through — check write permissions and try again. Already-saved rows above are safe.</p>`;
-      toast('Import error');
-    }
+    pendingQuickAdd = { toCreate, toUpdate, errors };
+    renderQuickAddPreview();
   });
+
+  document.getElementById('bulkCancelBtn').addEventListener('click', () => {
+    pendingQuickAdd = null;
+    document.getElementById('bulkPreviewWrap').classList.add('hidden');
+  });
+
+  document.getElementById('bulkConfirmBtn').addEventListener('click', confirmQuickAdd);
+}
+
+function renderQuickAddPreview() {
+  const { toCreate, toUpdate, errors } = pendingQuickAdd;
+  const wrap = document.getElementById('bulkPreviewWrap');
+  const summary = document.getElementById('bulkPreviewSummary');
+  const list = document.getElementById('bulkPreviewList');
+  document.getElementById('bulkResults').innerHTML = '';
+
+  summary.textContent = `${toCreate.length} new · ${toUpdate.length} updating existing${errors.length ? ' · ' + errors.length + ' errors' : ''}`;
+  list.innerHTML =
+    toCreate.map(r => `<div class="bulk-result-row created"><span>${escapeHtml(r.title)}</span><span class="bulk-result-tag">new</span></div>`).join('') +
+    toUpdate.map(r => `<div class="bulk-result-row updated"><span>${escapeHtml(r.title)}</span><span class="bulk-result-tag">update existing</span></div>`).join('') +
+    errors.map(r => `<div class="bulk-result-row error"><span>${escapeHtml(r.line)}</span><span class="bulk-result-tag">error</span></div>`).join('');
+
+  wrap.classList.remove('hidden');
+  document.getElementById('bulkConfirmBtn').classList.toggle('disabled', !toCreate.length && !toUpdate.length);
+}
+
+async function confirmQuickAdd() {
+  if (!pendingQuickAdd) return;
+  const { toCreate, toUpdate } = pendingQuickAdd;
+  if (!toCreate.length && !toUpdate.length) { toast('Nothing to save'); return; }
+
+  const resultsEl = document.getElementById('bulkResults');
+  document.getElementById('bulkPreviewWrap').classList.add('hidden');
+  resultsEl.innerHTML = '<p class="muted small">Saving…</p>';
+
+  let savedCount = 0, errorCount = 0;
+  try {
+    // Updating an existing record only sends the fields we set here — Airtable leaves
+    // everything else (ratings, watch history, etc.) on that record untouched.
+    for (const u of toUpdate) {
+      await patchRecord(u.id, u.fields);
+      savedCount++;
+    }
+    if (toCreate.length) {
+      await createRecords(toCreate.map(r => r.fields));
+      savedCount += toCreate.length;
+    }
+    RECORDS = await fetchAllRecords();
+    saveCache(RECORDS);
+    renderAll();
+    resultsEl.innerHTML = `<div class="bulk-summary">✔ ${savedCount} saved${errorCount ? ' · ' + errorCount + ' errors' : ''}</div>`;
+    document.getElementById('bulkTextarea').value = '';
+    toast('Quick Add complete');
+  } catch (e) {
+    console.error(e);
+    errorCount = (toCreate.length + toUpdate.length) - savedCount;
+    resultsEl.innerHTML = `<div class="bulk-summary">⚠ ${savedCount} saved before an error · ${errorCount} not saved</div><p class="muted small">Check write permissions and try the remaining rows again. Already-saved rows are safe and won't duplicate.</p>`;
+    toast('Quick Add stopped on an error');
+  } finally {
+    pendingQuickAdd = null;
+  }
 }
 
 /* ---------------- Install prompt (PWA) ---------------- */
@@ -858,7 +938,43 @@ function renderListScreen(name) {
   }
 }
 
-/* ---------------- Mood results (dynamic screen) ---------------- */
+/* ---------------- Fetch Missing Posters (Settings) ---------------- */
+
+function wireFetchMissingPosters() {
+  document.getElementById('fetchMissingPostersBtn').addEventListener('click', async () => {
+    if (!CONFIG.tmdbKey) { toast('Add a TMDb API key above first'); return; }
+    const statusEl = document.getElementById('posterFetchStatus');
+    const missing = RECORDS.filter(r => !posterUrl(r));
+    if (!missing.length) { statusEl.textContent = 'Every title already has artwork.'; return; }
+    if (!CONFIG.writeEnabled) {
+      statusEl.textContent = `Read-only mode: posters will display temporarily but won't be saved. Enable write access above to persist them.`;
+    }
+
+    let saved = 0, displayedOnly = 0, notFound = 0, fieldIssue = false;
+    for (let i = 0; i < missing.length; i++) {
+      const record = missing[i];
+      statusEl.textContent = `Fetching ${i + 1} of ${missing.length}…`;
+      const url = await fetchTmdbPoster(record);
+      if (!url) { notFound++; }
+      else if (CONFIG.writeEnabled) {
+        const result = await savePosterUrlToAirtable(record, url);
+        if (result.ok) saved++;
+        else { displayedOnly++; fieldIssue = true; }
+      } else {
+        displayedOnly++;
+      }
+      await new Promise(res => setTimeout(res, 280)); // simple rate limit so we don't hammer TMDb
+    }
+
+    saveCache(RECORDS);
+    renderAll();
+    statusEl.textContent = `Done — ${saved} saved, ${notFound} not found on TMDb${displayedOnly ? `, ${displayedOnly} found but not saved` : ''}.`;
+    if (fieldIssue) {
+      statusEl.textContent += ` Add a "Poster URL" field (single line text or URL) to Titles in Airtable so these can be saved.`;
+    }
+    toast('Poster fetch complete');
+  });
+}
 
 function showMoodResults(mood) {
   SCREEN_MAP.moodresult = {

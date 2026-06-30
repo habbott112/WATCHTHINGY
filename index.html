@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Henry Watch Tracker v5</title>
+<title>Henry Watch Tracker v6</title>
 <meta name="theme-color" content="#0B0D10" />
 <meta name="description" content="A private mobile watch tracker for Henry, backed by Airtable." />
 
@@ -64,7 +64,11 @@
       </label>
       <button id="cfgSaveBtn" class="btn-primary full">Connect</button>
       <p class="muted small">Need a token? In Airtable: Account → Developer Hub → Personal access tokens. Scopes: <code>data.records:read</code> (add <code>data.records:write</code> only if you want write-back). Access: this base only.</p>
-      <p class="muted small">TMDb key is free at themoviedb.org → Settings → API. Used only to fetch a poster image when a title has none in Airtable — nothing is written back to TMDb or Airtable.</p>
+      <p class="muted small">TMDb key is free at themoviedb.org → Settings → API. Used only to fetch a poster image when a title has none in Airtable — nothing is written back to TMDb.</p>
+
+      <div class="settings-divider"></div>
+      <button id="fetchMissingPostersBtn" class="btn-secondary full">🖼 Fetch Missing Posters</button>
+      <p id="posterFetchStatus" class="muted small"></p>
     </div>
   </section>
 
@@ -93,6 +97,7 @@
     <div class="dash-block">
       <h2 class="section-label">Jump in</h2>
       <div class="quicklinks">
+        <button class="quicklink" data-goto="bulkimport">⚡ Quick Add</button>
         <button class="quicklink" data-goto="hiddengems">💎 Hidden Gems</button>
         <button class="quicklink" data-goto="favorites">★ Favorites</button>
         <button class="quicklink" data-goto="needrating">✍️ Need Rating</button>
@@ -211,15 +216,25 @@
   <!-- Bulk Paste Import -->
   <section id="screen-bulkimport" class="screen">
     <div class="screen-header">
-      <h1 class="ticket-title">Bulk Import</h1>
+      <h1 class="ticket-title">Quick Add</h1>
     </div>
     <p class="muted small">Paste recommendations from ChatGPT, one per line, in this format:</p>
-    <div class="bulk-format-hint">Title | Type | Year | Language | Priority Queue | Mood | Match % | Why It Was Recommended
+    <div class="bulk-format-hint">Title | Type | Year | Language | Priority Queue | Mood | Match % | Why It Was Recommended | Current Streaming
 
-Shot Caller | Movie | 2017 | English | Watch Next | Crime/Thriller | 99 | Because it matches Sicario, Wind River, End of Watch, and Shooter.</div>
+Shot Caller | Movie | 2017 | English | Watch Next | Crime/Thriller | 99 | Because it matches Sicario, Wind River, End of Watch, and Shooter. | Netflix</div>
     <textarea id="bulkTextarea" class="bulk-textarea" placeholder="Paste lines here…"></textarea>
-    <button id="bulkImportBtn" class="btn-primary full">Parse &amp; Import</button>
+    <button id="bulkImportBtn" class="btn-primary full">Preview</button>
     <p id="bulkWriteWarning" class="muted small hidden">Read-only mode — enable a write-scoped token in Settings before importing.</p>
+
+    <div id="bulkPreviewWrap" class="hidden">
+      <div class="bulk-summary" id="bulkPreviewSummary"></div>
+      <div id="bulkPreviewList" class="bulk-results"></div>
+      <div class="detail-actions" style="margin-top:14px">
+        <button id="bulkConfirmBtn" class="btn-primary">✔ Confirm &amp; Save</button>
+        <button id="bulkCancelBtn" class="btn-secondary">Cancel</button>
+      </div>
+    </div>
+
     <div id="bulkResults" class="bulk-results"></div>
   </section>
 
@@ -275,7 +290,7 @@ Shot Caller | Movie | 2017 | English | Watch Next | Crime/Thriller | 99 | Becaus
       <button class="more-item" id="moreMoodBtn">🌙 Tonight's Mood</button>
       <button class="more-item" id="morePickBtn">🎲 Pick Something</button>
       <button class="more-item" data-screen="addrec">➕ Add Recommendation</button>
-      <button class="more-item" data-screen="bulkimport">📋 Bulk Import</button>
+      <button class="more-item" data-screen="bulkimport">⚡ Quick Add</button>
       <button class="more-item" data-screen="previously">📼 Previously Watched</button>
       <button class="more-item" data-screen="favorites">★ Favorites</button>
       <button class="more-item" data-screen="rewatch">🔁 Rewatch Soon</button>
